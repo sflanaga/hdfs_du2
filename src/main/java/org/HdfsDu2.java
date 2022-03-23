@@ -1,13 +1,19 @@
 package org;
 
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.commons.compress.compressors.zstandard.ZstdCompressorOutputStream;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.*;
-import org.eclipse.jetty.util.BlockingArrayQueue;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import picocli.CommandLine;
 
-import java.io.BufferedWriter;
-import java.io.File;
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -18,44 +24,102 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 public class HdfsDu2 {
+    public static class Cli {
+        @CommandLine.Option(names = {"-t", "--thread_workers"}, arity = "1", required = false, defaultValue = "4",
+                description = "number of workers thread listing directories")
+        int numWorkers;
 
+        @CommandLine.Option( names = {"-z", "--zstd_output"},
+                description = "enable zstd output - a .zst will be adding to output filename as well")
+        boolean zstdOutput;
+
+        @CommandLine.Option( names = {"-c", "--zstd_compression_level"}, required = false, defaultValue = "3",
+                description = "sets zstd compression level - 3 is default")
+        int zstdCompressionLevel;
+
+        @CommandLine.Parameters(index="0", description = "top or root path to descend into")
+        String rootDir;
+
+        @CommandLine.Option(names = {"-l", "--write_local"},
+                description = "write output to local file system instead of the default hdfs")
+        boolean writeLocalOutput;
+
+        @CommandLine.Option(names = {"-p", "--print_properties"},
+                description = "print effective hdfs properties - for debugging")
+        boolean printProperties;
+
+        @CommandLine.Parameters(index="1", description = "output file/path in hdfs")
+        String outputFileName;
+
+        @CommandLine.Option( names = {"-L", "--limit_output"}, required = false, defaultValue = "0",
+                description = "limits output to N records or some above - not exacting - 0 is default and means no limit")
+        long limit;
+
+        @CommandLine.Option(names = {"-h", "--help"}, usageHelp = true, description = "display this help message")
+        boolean usageHelpRequested;
+    }
+
+    public static BufferedOutputStream createOutputStream(Cli cli, FileSystem fs) throws IOException {
+        String outfilename = cli.outputFileName;
+        OutputStream os = null;
+        if ( cli.zstdOutput ) {
+            if (!outfilename.endsWith(".zst")) {
+                outfilename += ".zst";
+                System.err.println("Modifying output filename to (compressed zst)" + outfilename);
+            }
+        }
+
+        // local or hdfs
+        if ( cli.writeLocalOutput ) {
+            java.nio.file.Path path = Paths.get(outfilename);
+            System.err.println("writing local: " + path.toFile().getAbsolutePath());
+            os = Files.newOutputStream(path);
+        } else {
+            os = fs.create(new Path(outfilename));
+        }
+
+        // compressed with zstd or not
+        if ( cli.zstdOutput ) {
+            return new BufferedOutputStream(
+                new ZstdCompressorOutputStream(os, cli.zstdCompressionLevel));
+        } else {
+            return new BufferedOutputStream(os);
+        }
+
+    }
 
     public static void main(String[] args) {
         try {
-//            double x = 111111.121212;
-//            System.out.printf("%,10.2f \n", x);
-//            System.exit(1);
 
-            int ia = 0;
-            String root = args[ia++];
-            int numWorkers = Integer.valueOf(args[ia++]);
-            String rootDir = args[ia++];
-            String outputFileName = args[ia++];
-
+            final Cli cli = new Cli();
+            try {
+                CommandLine cl = new CommandLine(cli);
+                cl.parseArgs(args);
+                if (cli.usageHelpRequested) {
+                    cl.usage(System.err);
+                    return;
+                }
+            } catch (Exception e) {
+                System.err.println("cli related exception: " + e);
+                return;
+            }
 
             Configuration hdfsConfig = new Configuration();
 
-//            hdfsConfig.addResource(new Path("file:///etc/hadoop/conf/core-site.xml")); // Replace with actual path
-//            hdfsConfig.addResource(new Path("file:///etc/hadoop/conf/hdfs-site.xml")); // Replace with actual path
-//            hdfsConfig.addResource(new Path("file:///etc/hadoop/conf/kms-site.xml")); // Replace with actual path
-//
-//            hdfsConfig.set("fs.hdfs.impl", "org.apache.hadoop.hdfs.DistributedFileSystem");
-
-            //org.apache.hadoop.hdfs.DistributedFileSystem
-            //hdfsConfig.addResource(root);
-
-            //hdfsConfig.set("fs.defaultFS", root);
-            //hdfsConfig.set("fs.default.name", root);
-
-            List<String> list = hdfsConfig.getValByRegex(".*").keySet().stream().sorted().collect(Collectors.toList());
-            for (String e : list) {
-                System.out.printf("HDFS conf: %s = %s\n", e, hdfsConfig.get(e));
+            if ( cli.printProperties) {
+                List<String> list = hdfsConfig.getValByRegex(".*").keySet().stream().sorted().collect(Collectors.toList());
+                for (String e : list) {
+                    System.out.printf("HDFS conf: %s = %s\n", e, hdfsConfig.get(e));
+                }
             }
+
             final FileSystem fs = FileSystem.get(hdfsConfig);
-            final BossWorkerQueue<FileStatus> queue = new BossWorkerQueue<FileStatus>(numWorkers);
+            final BossWorkerQueue<FileStatus> queue = new BossWorkerQueue<FileStatus>(cli.numWorkers);
             final AtomicLong countDir = new AtomicLong();
             final AtomicLong countFile = new AtomicLong();
-            FileStatus first = fs.getFileStatus(new Path(rootDir));
+            final AtomicLong countBytes = new AtomicLong();
+            final AtomicLong recordsWritten = new AtomicLong();
+            FileStatus first = fs.getFileStatus(new Path(cli.rootDir));
             if (!first.isDirectory()) {
                 System.err.printf("first path \"%s\" is not a directory\n", first.getPath());
                 return;
@@ -63,42 +127,51 @@ public class HdfsDu2 {
 
             queue.give(first);
 
-            final ArrayBlockingQueue<Optional<String>> writeQueue = new ArrayBlockingQueue<Optional<String>>(100000);
+            final ArrayBlockingQueue<Optional<byte[]>> writeQueue = new ArrayBlockingQueue<Optional<byte[]>>(100000);
+
+            final ThreadState threadState = new ThreadState(cli.numWorkers+1);
 
             Thread writer = new Thread(() -> {
-
-                try (FSDataOutputStream outfile = fs.create(new Path(outputFileName))) {
-
+                int pos = cli.numWorkers;
+                try (BufferedOutputStream outfile = createOutputStream(cli, fs)) {
                     while (true) {
-                        Optional<String> l = writeQueue.take();
-                        if (l.isPresent())
-                            outfile.writeBytes(l.get() + "\n");
+                        threadState.setState(pos,'Q');
+                        Optional<byte[]> l = writeQueue.take();
+                        threadState.setState(pos,'W');
+                        if (l.isPresent()) {
+                            outfile.write(l.get());
+                            countBytes.addAndGet(l.get().length);
+                            recordsWritten.incrementAndGet();
+                            // we cannot allow this guy to quit or it may limit writers ability to finish.
+                            // so will usually go past the limit
+                        }
                         else
                             return;
                     }
                 } catch (Exception e) {
                     e.printStackTrace();
+                } finally {
+                    threadState.setState(pos, 'D');
                 }
 
             });
             writer.setName("writer");
             writer.start();
 
-            List<Thread> workers = IntStream.range(0, numWorkers).boxed().map(i -> {
+            List<Thread> workers = IntStream.range(0, cli.numWorkers).boxed().map(i -> {
                 Thread t = new Thread(() -> {
                     try {
+                        threadState.setState(i, 'S');
                         ArrayList<FileStatus> dirList = new ArrayList<FileStatus>(1000);
                         StringBuilder bld = new StringBuilder(100);
                         while (true) {
                             dirList.clear();
 
+                            threadState.setState(i, 'Q');
                             FileStatus dirStatus = queue.take();
+                            threadState.setState(i, 'L');
                             if (dirStatus == null)
                                 break;
-
-//                            DirStats stat = new DirStats();
-//                            stat.path = dirStatus.getPath();
-
 
                             FileStatus[] filelist = null;
                             try {
@@ -111,6 +184,8 @@ public class HdfsDu2 {
                                 System.err.println("ex: " + s);
                                 continue;
                             }
+                            threadState.setState(i, 'E');
+
                             for (FileStatus entry : filelist) {
                                 bld.setLength(0);
                                 if (entry.isDirectory()) {
@@ -135,15 +210,32 @@ public class HdfsDu2 {
                                         .append(entry.getModificationTime())
                                         .append('|')
                                         .append(entry.getOwner());
-                                writeQueue.put(Optional.of(bld.toString()));
+                                // trying to offload UTF 8 encoding in worker thread
+                                threadState.setState(i, 'P');
+
+                                writeQueue.put(Optional.of((bld.toString() + "\n").getBytes(StandardCharsets.UTF_8)));
                             }
                             //walkUpTree(stat);
+
+                            threadState.setState(i, 'R');
+
                             for (FileStatus entry : dirList) {
                                 queue.give(entry);
                             }
+                            if ( cli.limit > 0 )
+                                if ( cli.limit <= (recordsWritten.get()) ) {
+                                    System.err.printf("Early finish as write limit %d reach at %d\n", cli.limit, recordsWritten.get());
+                                    queue.forceDone();
+                                    threadState.setState(i, 'F');
+
+                                }
+
                         }
+                        threadState.setState(i, 'D');
+
                     } catch (Exception e) {
                         e.printStackTrace();
+                        threadState.setState(i, 'E');
                     }
                 });
                 t.setName("work" + i);
@@ -169,11 +261,11 @@ public class HdfsDu2 {
                         long deltaFile = thisFileCount - lastFile;
                         double rateFile = deltaFile * 1_000_000_000.0 / intervalTime;
                         double avgFileRate = thisFileCount * 1_000_000_000.0 / (now - start);
-                        System.out.printf("%7s q-size: %,10d dir: %,10d (%,8d) file: %,10d (%,8d) file rate: %,6.0f  Avg rate: %,6.0f\n",
-                                humanTime(now - start, 2),
-                                queue.size(),
+                        long mb = countBytes.get() / (1024L*1024L);
+                        System.out.printf("%7s q-size: %,10d dir: %,10d (%,8d) file: %,10d (%,8d) file rate: %,6.0f  Avg rate: %,6.0f, MB: %,5d out-q: %,10d state: %s\n",
+                                humanTime(now - start, 2), queue.size(),
                                 thisDirCount, deltaDir,
-                                thisFileCount, deltaFile, rateFile, avgFileRate);
+                                thisFileCount, deltaFile, rateFile, avgFileRate, mb, writeQueue.size(), threadState.toString());
                         lastDir = thisDirCount;
                         lastFile = thisFileCount;
                         lastTime = now;
@@ -189,7 +281,7 @@ public class HdfsDu2 {
             for (Thread t : workers) {
                 t.join();
             }
-            //ticker.interrupt();
+            System.err.println("workers done - stopping writer at: " + writeQueue.size());
             writeQueue.put(Optional.empty());
             writer.join();
 

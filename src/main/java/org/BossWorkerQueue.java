@@ -86,6 +86,28 @@ public class BossWorkerQueue<T> {
 
     }
 
+    public void giveLast(T job) {
+        lock.lock();
+        try {
+            queue.addLast(job);
+            if ( awaiters > 0 )
+                stateChange.signalAll();
+        } finally {
+            lock.unlock();
+        }
+
+    }
+    public void forceDone() {
+        lock.lock();
+        try {
+            done = true;
+            stateChange.signalAll();
+        } finally {
+            lock.unlock();
+        }
+
+    }
+
     public static AtomicLong count = new AtomicLong(0);
 
     public static void main(String[] args) {
