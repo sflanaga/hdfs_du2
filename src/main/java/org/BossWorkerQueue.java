@@ -74,6 +74,19 @@ public class BossWorkerQueue<T> {
         }
     }
 
+    public void giveAll(List<T> jobList) {
+        lock.lock();
+        try {
+            for(T j: jobList)
+                queue.addFirst(j);
+            if ( awaiters > 0 )
+                stateChange.signalAll();
+        } finally {
+            lock.unlock();
+        }
+
+    }
+
     public void give(T job) {
         lock.lock();
         try {

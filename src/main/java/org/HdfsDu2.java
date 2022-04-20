@@ -1,22 +1,20 @@
 package org;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorOutputStream;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.DistributedFileSystem;
+import org.apache.hadoop.security.UserGroupInformation;
 import picocli.CommandLine;
 
-import java.io.BufferedOutputStream;
-import java.io.IOException;
-import java.io.OutputStream;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -24,8 +22,10 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 public class HdfsDu2 {
+    private static boolean debug = false;
+
     public static class Cli {
-        @CommandLine.Option(names = {"-t", "--thread_workers"}, arity = "1", required = false, defaultValue = "4",
+        @CommandLine.Option(names = {"-t", "--thread_workers"}, arity = "1", defaultValue = "4",
                 description = "number of workers thread listing directories")
         int numWorkers;
 
@@ -37,8 +37,20 @@ public class HdfsDu2 {
                 description = "sets zstd compression level - 3 is default")
         int zstdCompressionLevel;
 
+        @CommandLine.Option( names = {"-C", "--config_properties"}, required = false, arity = "1..N",
+                description = "load configuration from 1 or more configuration files as hadoop resources")
+        List<java.nio.file.Path> confProps;
+
+        @CommandLine.Option( names = {"-q", "--write_queue_size"}, required = false, defaultValue = "100000",
+                description = "size of the queue between the workers and the 1 writer thread")
+        int writeQueueSize;
+
         @CommandLine.Parameters(index="0", description = "top or root path to descend into")
         String rootDir;
+
+        @CommandLine.Option(names = {"-s", "--single_directory"}, defaultValue = "false",
+                description = "get a single directory of files/paths - default is to recurse")
+        boolean singleDir;
 
         @CommandLine.Option(names = {"-l", "--write_local"},
                 description = "write output to local file system instead of the default hdfs")
@@ -55,7 +67,31 @@ public class HdfsDu2 {
                 description = "limits output to N records or some above - not exacting - 0 is default and means no limit")
         long limit;
 
-        @CommandLine.Option(names = {"-h", "--help"}, usageHelp = true, description = "display this help message")
+        @CommandLine.Option( names = {"-d", "--debug"}, required = false,
+                description = "writes lots of extra debug output to stderr")
+        boolean debug;
+
+        @CommandLine.Option( names = {"--core_site"}, defaultValue = "/etc/hadoop/conf/core-site.xml",
+                description = "core-site xml configuration to use")
+        String coreSitePath;
+
+        @CommandLine.Option( names = {"--hdfs_site"}, defaultValue = "/etc/hadoop/conf/hdfs-site.xml",
+                description = "hdfs-site xml configuration to use")
+        String hdfsSitePath;
+
+        @CommandLine.Option( names = {"--krb5_conf"}, defaultValue = "/etc/krb5.conf",
+                description = "krb5 main conf location")
+        String krb5Path;
+
+        @CommandLine.Option( names = {"--krb5_user"}, required=true,
+                description = "krb5 user - e.g. adm_joe1@HDPQUANTUMPROD.COM")
+        String krbUser;
+
+        @CommandLine.Option( names = {"--krb5_key_tab"}, required=true,
+                description = "krb5 key tab file location - e.g. /etc/security/keytabs/adm_joe1.user.keytab")
+        String krbKeyTab;
+
+        @CommandLine.Option(names = {"-h", "--help"}, usageHelp = true, description = "display this help message\nsample cmdline: java -cp hdfs_du2-1.0-SNAPSHOT.jar:lib/* org.HdfsDu2 /prod test --krb5_user adm_sflanag1@HDPQUANTUMPROD.COM --krb5_key_tab /etc/security/keytabs/adm_sflanag1.user.keytab")
         boolean usageHelpRequested;
     }
 
@@ -88,6 +124,50 @@ public class HdfsDu2 {
 
     }
 
+    public static void populateConfigWithProperties(Configuration cfg, List<java.nio.file.Path> propFileList) throws IOException {
+        for ( java.nio.file.Path path: propFileList) {
+            if ( debug )
+                System.err.println("reading configuration from: " + path);
+
+            cfg.addResource(path.toString());
+        }
+        /*
+        Properties prop = new Properties();
+        InputStream is =Files.newInputStream(propFile);
+        if ( propFile.toString().contains(".xml"))
+            prop.loadFromXML(is);
+        else
+            prop.load(is);
+        for(Map.Entry<Object, Object> p: prop.entrySet()) {
+            cfg.set(p.getKey().toString(), p.getValue().toString());
+        }
+        cfg.addResource();
+
+         */
+    }
+
+    public static FileSystem getHdfsFileSystem(String coreSiteXml, String hdfsSiteXml, String krb5confLoc, String keyTabLoc) {
+        try {
+
+            Configuration config = new Configuration();
+
+            config.addResource(new org.apache.hadoop.fs.Path(coreSiteXml));
+            config.addResource(new org.apache.hadoop.fs.Path(hdfsSiteXml));
+            config.set("hadoop.security.authentication", "Kerberos");
+            config.addResource(krb5confLoc);
+            config.set("fs.hdfs.impl", org.apache.hadoop.hdfs.DistributedFileSystem.class.getName());
+            config.set("fs.file.impl", org.apache.hadoop.fs.LocalFileSystem.class.getName());
+            System.setProperty("java.security.krb5.conf", krb5confLoc);
+            org.apache.hadoop.security.HadoopKerberosName.setConfiguration(config);
+            UserGroupInformation.setConfiguration(config);
+            UserGroupInformation.loginUserFromKeytab("adm_sflanag1@HDPQUANTUMPROD.COM", keyTabLoc);
+            return org.apache.hadoop.fs.FileSystem.get(config);
+        } catch (Exception ex) {
+            throw new RuntimeException("error getting hdfs fs setup: " + ex.getMessage(), ex);
+        }
+    }
+
+
     public static void main(String[] args) {
         try {
 
@@ -99,21 +179,32 @@ public class HdfsDu2 {
                     cl.usage(System.err);
                     return;
                 }
+                debug = cli.debug;
             } catch (Exception e) {
                 System.err.println("cli related exception: " + e);
                 return;
             }
 
-            Configuration hdfsConfig = new Configuration();
+//            Configuration hdfsConfig = new Configuration();
+//            if ( cli.confProps != null )
+//                populateConfigWithProperties(hdfsConfig, cli.confProps);
+//
+//            if ( cli.debug ) {
+//                for(String k: hdfsConfig.getValByRegex(".*").keySet().stream().sorted().collect(Collectors.toList()))
+//                    System.err.printf("hdfs prop: %s = %s\n", k, hdfsConfig.get(k));
+//            }
+//
+//            if ( cli.printProperties) {
+//                List<String> list = hdfsConfig.getValByRegex(".*").keySet().stream().sorted().collect(Collectors.toList());
+//                for (String e : list) {
+//                    System.out.printf("HDFS conf: %s = %s\n", e, hdfsConfig.get(e));
+//                }
+//            }
 
-            if ( cli.printProperties) {
-                List<String> list = hdfsConfig.getValByRegex(".*").keySet().stream().sorted().collect(Collectors.toList());
-                for (String e : list) {
-                    System.out.printf("HDFS conf: %s = %s\n", e, hdfsConfig.get(e));
-                }
-            }
-
-            final FileSystem fs = FileSystem.get(hdfsConfig);
+            final FileSystem fs = getHdfsFileSystem(cli.coreSitePath, cli.hdfsSitePath, cli.krb5Path, cli.krbKeyTab);
+            //new DistributedFileSystem(hdfsConfig); // FileSystem.get(hdfsConfig);
+            if ( debug )
+                System.err.println("FileSystem type: " + fs.getClass().getName());
             final BossWorkerQueue<FileStatus> queue = new BossWorkerQueue<FileStatus>(cli.numWorkers);
             final AtomicLong countDir = new AtomicLong();
             final AtomicLong countFile = new AtomicLong();
@@ -125,166 +216,173 @@ public class HdfsDu2 {
                 return;
             }
 
-            queue.give(first);
-
-            final ArrayBlockingQueue<Optional<byte[]>> writeQueue = new ArrayBlockingQueue<Optional<byte[]>>(100000);
-
-            final ThreadState threadState = new ThreadState(cli.numWorkers+1);
-
-            Thread writer = new Thread(() -> {
-                int pos = cli.numWorkers;
-                try (BufferedOutputStream outfile = createOutputStream(cli, fs)) {
-                    while (true) {
-                        threadState.setState(pos,'Q');
-                        Optional<byte[]> l = writeQueue.take();
-                        threadState.setState(pos,'W');
-                        if (l.isPresent()) {
-                            outfile.write(l.get());
-                            countBytes.addAndGet(l.get().length);
-                            recordsWritten.incrementAndGet();
-                            // we cannot allow this guy to quit or it may limit writers ability to finish.
-                            // so will usually go past the limit
-                        }
-                        else
-                            return;
-                    }
-                } catch (Exception e) {
-                    e.printStackTrace();
-                } finally {
-                    threadState.setState(pos, 'D');
+            if ( cli.singleDir ) {
+                FileStatus[] filelist = fs.listStatus(first.getPath());
+                for(FileStatus sta: filelist) {
+                    System.out.println(sta.getPath());
                 }
+            } else { // recurse the world
 
-            });
-            writer.setName("writer");
-            writer.start();
+                queue.give(first);
 
-            List<Thread> workers = IntStream.range(0, cli.numWorkers).boxed().map(i -> {
-                Thread t = new Thread(() -> {
-                    try {
-                        threadState.setState(i, 'S');
-                        ArrayList<FileStatus> dirList = new ArrayList<FileStatus>(1000);
-                        StringBuilder bld = new StringBuilder(100);
+                final ArrayBlockingQueue<Optional<byte[]>> writeQueue = new ArrayBlockingQueue<Optional<byte[]>>(cli.writeQueueSize);
+
+                final ThreadState threadState = new ThreadState(cli.numWorkers + 1);
+
+                Thread writer = new Thread(() -> {
+                    int pos = cli.numWorkers;
+                    try (BufferedOutputStream outfile = createOutputStream(cli, fs)) {
                         while (true) {
-                            dirList.clear();
+                            threadState.setStateLockless(pos, 'Q');
+                            Optional<byte[]> l = writeQueue.take();
+                            threadState.setStateLockless(pos, 'W');
+                            if (l.isPresent()) {
+                                outfile.write(l.get());
+                                countBytes.addAndGet(l.get().length);
+                                recordsWritten.incrementAndGet();
+                                // we cannot allow this guy to quit or it may limit writers ability to finish.
+                                // so will usually go past the limit
+                            } else
+                                return;
+                        }
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    } finally {
+                        threadState.setStateLockless(pos, '*');
+                    }
 
-                            threadState.setState(i, 'Q');
-                            FileStatus dirStatus = queue.take();
-                            threadState.setState(i, 'L');
-                            if (dirStatus == null)
-                                break;
+                });
+                writer.setName("writer");
+                writer.start();
 
-                            FileStatus[] filelist = null;
-                            try {
-                                filelist = fs.listStatus(dirStatus.getPath());
-                            } catch (Exception e) {
-                                String s = e.getMessage();
-                                int index = s.indexOf('\n');
-                                if ( index > 0 )
-                                    s = s.substring(0, index);
-                                System.err.println("ex: " + s);
-                                continue;
-                            }
-                            threadState.setState(i, 'E');
+                List<Thread> workers = IntStream.range(0, cli.numWorkers).boxed().map(i -> {
+                    Thread t = new Thread(() -> {
+                        try {
+                            threadState.setStateLockless(i, 'S');
+                            ArrayList<FileStatus> dirList = new ArrayList<FileStatus>(1000);
+                            StringBuilder bld = new StringBuilder(100);
+                            while (true) {
+                                dirList.clear();
 
-                            for (FileStatus entry : filelist) {
-                                bld.setLength(0);
-                                if (entry.isDirectory()) {
-                                    dirList.add(entry);
-                                    bld.append("D|");
-                                    countDir.incrementAndGet();
+                                threadState.setStateLockless(i, 'Q');
+                                FileStatus dirStatus = queue.take();
+                                threadState.setStateLockless(i, 'L');
+                                if (dirStatus == null)
+                                    break;
+
+                                FileStatus[] filelist = null;
+                                try {
+                                    filelist = fs.listStatus(dirStatus.getPath());
+                                } catch (Exception e) {
+                                    String s = e.getMessage();
+                                    int index = s.indexOf('\n');
+                                    if (index > 0)
+                                        s = s.substring(0, index);
+                                    System.err.println("ex: " + s);
+                                    continue;
+                                }
+                                threadState.setStateLockless(i, 'P');
+
+                                long puts = 0;
+                                for (FileStatus entry : filelist) {
+                                    bld.setLength(0);
+                                    if (entry.isDirectory()) {
+                                        dirList.add(entry);
+                                        bld.append("D|");
 //                                    stat.dircount++;
-                                } else if (entry.isSymlink()) {
-                                    bld.append("S|");
+                                    } else if (entry.isSymlink()) {
+                                        bld.append("S|");
 //                                    stat.size += entry.getLen();
 //                                    stat.filecount++;
 //                                    stat.oldest = Math.max(entry.getModificationTime(), stat.oldest);
 //                                    stat.youngest = Math.min(entry.getModificationTime(), stat.youngest);
-                                } else {
-                                    countFile.incrementAndGet();
-                                    bld.append("F|");
+                                    } else {
+                                        countFile.incrementAndGet();
+                                        bld.append("F|");
+                                    }
+                                    bld.append(entry.getPath())
+                                            .append('|')
+                                            .append(entry.getLen())
+                                            .append('|')
+                                            .append(entry.getModificationTime())
+                                            .append('|')
+                                            .append(entry.getOwner());
+                                    // trying to offload UTF 8 encoding in worker thread
+                                    writeQueue.put(Optional.of((bld.toString() + "\n").getBytes(StandardCharsets.UTF_8)));
+                                    puts++;
                                 }
-                                bld.append(entry.getPath())
-                                        .append('|')
-                                        .append(entry.getLen())
-                                        .append('|')
-                                        .append(entry.getModificationTime())
-                                        .append('|')
-                                        .append(entry.getOwner());
-                                // trying to offload UTF 8 encoding in worker thread
-                                threadState.setState(i, 'P');
+                                countFile.addAndGet(puts);
 
-                                writeQueue.put(Optional.of((bld.toString() + "\n").getBytes(StandardCharsets.UTF_8)));
+                                threadState.setStateLockless(i, 'R');
+
+                                queue.giveAll(dirList);
+                                countDir.addAndGet(dirList.size());
+
+                                if (cli.limit > 0)
+                                    if (cli.limit <= (recordsWritten.get())) {
+                                        System.err.printf("Early finish as write limit %d reach at %d\n", cli.limit, recordsWritten.get());
+                                        queue.forceDone();
+                                        threadState.setStateLockless(i, 'F');
+
+                                    }
+
                             }
-                            //walkUpTree(stat);
+                            threadState.setStateLockless(i, 'D');
 
-                            threadState.setState(i, 'R');
-
-                            for (FileStatus entry : dirList) {
-                                queue.give(entry);
-                            }
-                            if ( cli.limit > 0 )
-                                if ( cli.limit <= (recordsWritten.get()) ) {
-                                    System.err.printf("Early finish as write limit %d reach at %d\n", cli.limit, recordsWritten.get());
-                                    queue.forceDone();
-                                    threadState.setState(i, 'F');
-
-                                }
-
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            threadState.setStateLockless(i, 'E');
+                        } finally {
+                            threadState.setStateLockless(i, '*');
                         }
-                        threadState.setState(i, 'D');
+                    });
+                    t.setName("work" + i);
+                    System.out.println("starting thread: " + i);
+                    t.start();
+                    return t;
+                }).collect(Collectors.toList());
 
+                Thread ticker = new Thread(() -> {
+                    long start = System.nanoTime();
+                    long lastTime = start;
+                    try {
+                        long lastDir = 0L;
+                        long lastFile = 0L;
+                        while (true) {
+                            Thread.sleep(5000);
+                            long now = System.nanoTime();
+                            double runtime = (start - now) / 1000.0D;
+                            long intervalTime = (now - lastTime);
+                            long thisDirCount = countDir.get();
+                            long thisFileCount = countFile.get();
+                            long deltaDir = thisDirCount - lastDir;
+                            long deltaFile = thisFileCount - lastFile;
+                            double rateFile = deltaFile * 1_000_000_000.0 / intervalTime;
+                            double avgFileRate = thisFileCount * 1_000_000_000.0 / (now - start);
+                            long mb = countBytes.get() / (1024L * 1024L);
+                            System.out.printf("%7s q-size: %,10d dir: %,10d (%,8d) file: %,10d (%,8d) file rate: %,6.0f  Avg rate: %,6.0f, MB: %,5d out-q: %,10d state: %s\n",
+                                    humanTime(now - start, 2), queue.size(),
+                                    thisDirCount, deltaDir,
+                                    thisFileCount, deltaFile, rateFile, avgFileRate, mb, writeQueue.size(), threadState.toString());
+                            lastDir = thisDirCount;
+                            lastFile = thisFileCount;
+                            lastTime = now;
+                        }
                     } catch (Exception e) {
                         e.printStackTrace();
-                        threadState.setState(i, 'E');
                     }
                 });
-                t.setName("work" + i);
-                System.out.println("starting thread: " + i);
-                t.start();
-                return t;
-            }).collect(Collectors.toList());
+                ticker.setDaemon(true);
+                ticker.setName("tic");
+                ticker.start();
 
-            Thread ticker = new Thread(() -> {
-                long start = System.nanoTime();
-                long lastTime = start;
-                try {
-                    long lastDir = 0L;
-                    long lastFile = 0L;
-                    while (true) {
-                        Thread.sleep(5000);
-                        long now = System.nanoTime();
-                        double runtime = (start - now)/1000.0D;
-                        long intervalTime = (now - lastTime);
-                        long thisDirCount = countDir.get();
-                        long thisFileCount = countFile.get();
-                        long deltaDir = thisDirCount - lastDir;
-                        long deltaFile = thisFileCount - lastFile;
-                        double rateFile = deltaFile * 1_000_000_000.0 / intervalTime;
-                        double avgFileRate = thisFileCount * 1_000_000_000.0 / (now - start);
-                        long mb = countBytes.get() / (1024L*1024L);
-                        System.out.printf("%7s q-size: %,10d dir: %,10d (%,8d) file: %,10d (%,8d) file rate: %,6.0f  Avg rate: %,6.0f, MB: %,5d out-q: %,10d state: %s\n",
-                                humanTime(now - start, 2), queue.size(),
-                                thisDirCount, deltaDir,
-                                thisFileCount, deltaFile, rateFile, avgFileRate, mb, writeQueue.size(), threadState.toString());
-                        lastDir = thisDirCount;
-                        lastFile = thisFileCount;
-                        lastTime = now;
-                    }
-                } catch (Exception e) {
-                    e.printStackTrace();
+                for (Thread t : workers) {
+                    t.join();
                 }
-            });
-            ticker.setDaemon(true);
-            ticker.setName("tic");
-            ticker.start();
-
-            for (Thread t : workers) {
-                t.join();
+                System.err.println("workers done - stopping writer at: " + writeQueue.size());
+                writeQueue.put(Optional.empty());
+                writer.join();
             }
-            System.err.println("workers done - stopping writer at: " + writeQueue.size());
-            writeQueue.put(Optional.empty());
-            writer.join();
-
 
         } catch (Exception e) {
             e.printStackTrace();

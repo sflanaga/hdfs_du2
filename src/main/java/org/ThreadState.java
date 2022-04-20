@@ -3,6 +3,9 @@ package org;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class ThreadState {
+
+
+
     final char[] states;
     // lock per entry?
     final ReentrantLock lock = new ReentrantLock();
@@ -27,5 +30,10 @@ public class ThreadState {
         } finally {
             lock.unlock();
         }
+    }
+    // this is not meant to be super thread sync'ed precise and
+    // setting this memory location... should be isolated much of the time.
+    public void setStateLockless(int i, char c) {
+        states[i] = c;
     }
 }
