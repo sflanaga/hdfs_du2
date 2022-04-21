@@ -1,13 +1,10 @@
 package org;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.compress.compressors.zstandard.ZstdCompressorOutputStream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hdfs.DistributedFileSystem;
-import org.apache.hadoop.security.UserGroupInformation;
 import picocli.CommandLine;
 
 import java.io.*;
@@ -146,27 +143,6 @@ public class HdfsDu2 {
          */
     }
 
-    public static FileSystem getHdfsFileSystem(String coreSiteXml, String hdfsSiteXml, String krb5confLoc, String keyTabLoc) {
-        try {
-
-            Configuration config = new Configuration();
-
-            config.addResource(new org.apache.hadoop.fs.Path(coreSiteXml));
-            config.addResource(new org.apache.hadoop.fs.Path(hdfsSiteXml));
-            config.set("hadoop.security.authentication", "Kerberos");
-            config.addResource(krb5confLoc);
-            config.set("fs.hdfs.impl", org.apache.hadoop.hdfs.DistributedFileSystem.class.getName());
-            config.set("fs.file.impl", org.apache.hadoop.fs.LocalFileSystem.class.getName());
-            System.setProperty("java.security.krb5.conf", krb5confLoc);
-            org.apache.hadoop.security.HadoopKerberosName.setConfiguration(config);
-            UserGroupInformation.setConfiguration(config);
-            UserGroupInformation.loginUserFromKeytab("adm_sflanag1@HDPQUANTUMPROD.COM", keyTabLoc);
-            return org.apache.hadoop.fs.FileSystem.get(config);
-        } catch (Exception ex) {
-            throw new RuntimeException("error getting hdfs fs setup: " + ex.getMessage(), ex);
-        }
-    }
-
 
     public static void main(String[] args) {
         try {
@@ -201,7 +177,12 @@ public class HdfsDu2 {
 //                }
 //            }
 
-            final FileSystem fs = getHdfsFileSystem(cli.coreSitePath, cli.hdfsSitePath, cli.krb5Path, cli.krbKeyTab);
+            if ( !Files.exists(Paths.get(cli.coreSitePath)))
+                throw new RuntimeException("core site file: " + cli.coreSitePath + " does not exist");
+            if ( !Files.exists(Paths.get(cli.hdfsSitePath)))
+                throw new RuntimeException("hdfs site file: " + cli.hdfsSitePath + " does not exist");
+
+            final FileSystem fs = Util.getHdfsFileSystem(cli.debug, cli.krbUser, cli.coreSitePath, cli.hdfsSitePath, cli.krb5Path, cli.krbKeyTab);
             //new DistributedFileSystem(hdfsConfig); // FileSystem.get(hdfsConfig);
             if ( debug )
                 System.err.println("FileSystem type: " + fs.getClass().getName());
@@ -385,6 +366,7 @@ public class HdfsDu2 {
             }
 
         } catch (Exception e) {
+            System.err.println("exception during runtime:");
             e.printStackTrace();
         }
     }
